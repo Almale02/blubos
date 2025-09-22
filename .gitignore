@@ -1,0 +1,28 @@
+
+limine/
+# Rust & Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Kernel build output
+boot/kernel.elf
+
+# Disk image & mount artifacts
+img/*.img
+img/mnt/
+
+# QEMU runtime state (if you don’t want to commit it)
+img/OVMF_VARS.fd
+img/OVMF_CODE.fd
+
+# Common editor/misc crap
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# VSCode / Helix / JetBrains settings
+.vscode/
+.helix/
+.idea/

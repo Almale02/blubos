@@ -1,0 +1,15 @@
+[build]
+target = "x86_64-blubos.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+
+[target.x86_64-blubos]
+linker = "ld.lld"
+rustflags = [
+"-C", "relocation-model=static",
+"-C", "link-args=-Tkernel.ld",
+"-C", "code-model=kernel"
+]
