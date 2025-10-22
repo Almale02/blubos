@@ -26,3 +26,10 @@ pub extern "x86-interrupt" fn irq0_handler(_stack_frame: InterruptStackFrame) {
         outb(0x20, 0x20);
     }
 }
+pub fn wait_ms(ms: usize) {
+    let start = TICKS.load(core::sync::atomic::Ordering::Relaxed);
+    let target = start + ms;
+    while TICKS.load(core::sync::atomic::Ordering::Relaxed) < target {
+        core::hint::spin_loop();
+    }
+}

@@ -34,10 +34,24 @@ SECTIONS
         __bss_end = .;
     }
 
-    /DISCARD/ :
-    {
+
+    /DISCARD/ : {
         *(.comment)
         *(.note)
         *(.eh_frame)
     }
+
+
+    .debug_info     0 (INFO) : { *(.debug_info*) }
+    .debug_abbrev   0 (INFO) : { *(.debug_abbrev*) }
+    .debug_loc      0 (INFO) : { *(.debug_loc*) }
+    .debug_macinfo  0 (INFO) : { *(.debug_macinfo*) }
+    .debug_pubnames 0 (INFO) : { *(.debug_pubnames*) }
+    .debug_pubtypes 0 (INFO) : { *(.debug_pubtypes*) }
+    .debug_str      0 (INFO) : { *(.debug_str*) }
+    .debug_ranges   0 (INFO) : { *(.debug_ranges*) }
+    .debug_line     0 (INFO) : { *(.debug_line*) }
+    .debug_aranges  0 (INFO) : { *(.debug_aranges*) }
+    .debug_frame    0 (INFO) : { *(.debug_frame*) }    
+    
 }

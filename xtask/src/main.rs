@@ -7,10 +7,29 @@ use std::{
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
-    let kernel_path = format!("target/x86_64-blubos/release/kernel");
+    let kernel_path;
     let boot_kernel = "boot/kernel.elf";
 
-    run_in_dir("cargo", &["build", "--release"], Path::new("kernel"));
+    let mode;
+    if let Some(second) = args.get(1) {
+        if second == "dbg" {
+            mode = "";
+
+            kernel_path = format!("target/x86_64-blubos/debug/kernel")
+        } else {
+            mode = "--release";
+            kernel_path = format!("target/x86_64-blubos/release/kernel")
+        }
+    } else {
+        mode = "--release";
+        kernel_path = format!("target/x86_64-blubos/release/kernel")
+    }
+
+    if mode == "" {
+        run_in_dir("cargo", &["build"], Path::new("kernel"));
+    } else {
+        run_in_dir("cargo", &["build", mode], Path::new("kernel"));
+    }
 
     fs::create_dir_all("boot").unwrap();
 

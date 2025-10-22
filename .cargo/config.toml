@@ -1,3 +1,5 @@
 [alias]
 build-kernel= "run -p xtask --release"
 run-kernel= "run -p xtask --release -- run"
+run-kernel-dbg= "run -p xtask --release -- run dbg"
+

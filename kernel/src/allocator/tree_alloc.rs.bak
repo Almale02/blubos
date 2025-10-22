@@ -1,0 +1,439 @@
+use alloc::boxed::Box;
+use bytesize::ByteSize;
+use core::{alloc::GlobalAlloc, ptr::null_mut};
+
+use crate::{
+    allocator::{
+        allocator::{KERNEL_ALLOC_MODE, KernelAllocMode, Region, find_heap_areas},
+        bump_alloc::{BUMP_ALLOCATOR, BUMP_HEAP_BASE, BUMP_HEAP_SIZE, BumpAlloc},
+    },
+    serial_print, serial_println,
+};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Color {
+    Red,
+    Black,
+}
+
+type NodeBox = Box<TreeRegion, &'static BumpAlloc>;
+
+pub struct TreeRegion {
+    pub base: usize,
+    pub size: usize,
+    color: Color,
+    max_size: usize,
+    left: Option<NodeBox>,
+    right: Option<NodeBox>,
+}
+
+impl TreeRegion {
+    fn new(base: usize, size: usize) -> Self {
+        Self {
+            base,
+            size,
+            color: Color::Red,
+            max_size: size,
+            left: None,
+            right: None,
+        }
+    }
+    fn end(&self) -> usize {
+        self.base + self.size
+    }
+}
+
+pub struct RBTreeAlloc {
+    root: Option<NodeBox>,
+    freelist: Option<NodeBox>, // NEW
+}
+
+impl RBTreeAlloc {
+    pub const fn new() -> Self {
+        Self {
+            root: None,
+            freelist: None,
+        }
+    }
+
+    fn is_red(x: &Option<NodeBox>) -> bool {
+        matches!(x, Some(r) if r.color == Color::Red)
+    }
+
+    fn update_max_size(n: &mut NodeBox) {
+        let mut max = n.size;
+        if let Some(ref l) = n.left {
+            max = max.max(l.max_size);
+        }
+        if let Some(ref r) = n.right {
+            max = max.max(r.max_size);
+        }
+        n.max_size = max;
+    }
+
+    fn rotate_left(mut h: NodeBox) -> NodeBox {
+        let mut x = h.right.take().unwrap();
+        h.right = x.left.take();
+        RBTreeAlloc::update_max_size(&mut h);
+        x.left = Some(h);
+        x.color = x.left.as_ref().unwrap().color;
+        x.left.as_mut().unwrap().color = Color::Red;
+        RBTreeAlloc::update_max_size(&mut x);
+        x
+    }
+    fn rotate_right(mut h: NodeBox) -> NodeBox {
+        let mut x = h.left.take().unwrap();
+        h.left = x.right.take();
+        RBTreeAlloc::update_max_size(&mut h);
+        x.right = Some(h);
+        x.color = x.right.as_ref().unwrap().color;
+        x.right.as_mut().unwrap().color = Color::Red;
+        RBTreeAlloc::update_max_size(&mut x);
+        x
+    }
+    fn flip_colors(h: &mut NodeBox) {
+        h.color = match h.color {
+            Color::Red => Color::Black,
+            Color::Black => Color::Red,
+        };
+        if let Some(ref mut l) = h.left {
+            l.color = match l.color {
+                Color::Red => Color::Black,
+                Color::Black => Color::Red,
+            };
+        }
+        if let Some(ref mut r) = h.right {
+            r.color = match r.color {
+                Color::Red => Color::Black,
+                Color::Black => Color::Red,
+            };
+        }
+    }
+
+    fn insert_node(h: Option<NodeBox>, node: NodeBox) -> NodeBox {
+        let mut h = match h {
+            None => return node,
+            Some(h) => h,
+        };
+        if node.base < h.base {
+            h.left = Some(Self::insert_node(h.left.take(), node));
+        } else {
+            h.right = Some(Self::insert_node(h.right.take(), node));
+        }
+        if Self::is_red(&h.right) && !Self::is_red(&h.left) {
+            h = Self::rotate_left(h);
+        }
+        if Self::is_red(&h.left) && Self::is_red(&h.left.as_ref().unwrap().left) {
+            h = Self::rotate_right(h);
+        }
+        if Self::is_red(&h.left) && Self::is_red(&h.right) {
+            Self::flip_colors(&mut h);
+        }
+        Self::update_max_size(&mut h);
+        h
+    }
+
+    pub fn insert(&mut self, region: Region) {
+        if region.size == 0 {
+            return;
+        }
+
+        // TreeRegion node allocated out of bump allocator
+        let node = Box::new_in(TreeRegion::new(region.base, region.size), &BUMP_ALLOCATOR);
+
+        self.root = Some(Self::insert_node(self.root.take(), node));
+        if let Some(r) = self.root.as_mut() {
+            r.color = Color::Black;
+        }
+    }
+    pub fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
+        let (root, out) = Self::alloc_rec(self.root.take(), size, align);
+        self.root = root;
+        if let Some(r) = self.root.as_mut() {
+            r.color = Color::Black;
+        }
+        out
+    }
+
+    fn alloc_rec(
+        node: Option<NodeBox>,
+        size: usize,
+        align: usize,
+    ) -> (Option<NodeBox>, Option<usize>) {
+        let mut n = match node {
+            None => return (None, None),
+            Some(n) => n,
+        };
+
+        // ---- search left ----
+        if let Some(ref l) = n.left {
+            if l.max_size >= size {
+                let (new_left, out) = Self::alloc_rec(n.left.take(), size, align);
+                if out.is_some() {
+                    n.left = new_left;
+                    Self::update_max_size(&mut n);
+                    return (Some(n), out);
+                }
+                n.left = new_left;
+                Self::update_max_size(&mut n);
+            }
+        }
+
+        // ---- try current node ----
+        let aligned = (n.base + (align - 1)) & !(align - 1);
+        let adj = aligned - n.base;
+
+        // ✅ Require strictly more than needed
+        if n.size > adj + size {
+            let alloc_base = aligned;
+            let consumed = adj + size;
+
+            // shrink this region forward
+            n.base += consumed;
+            n.size -= consumed;
+            Self::update_max_size(&mut n);
+            return (Some(n), Some(alloc_base));
+        }
+
+        // otherwise: either exact fit or too small -> skip it
+
+        // ---- search right ----
+        if let Some(ref r) = n.right {
+            if r.max_size >= size {
+                let (new_right, out) = Self::alloc_rec(n.right.take(), size, align);
+                if out.is_some() {
+                    n.right = new_right;
+                    Self::update_max_size(&mut n);
+                    return (Some(n), out);
+                }
+                n.right = new_right;
+                Self::update_max_size(&mut n);
+            }
+        }
+
+        // ---- no fit ----
+        Self::update_max_size(&mut n);
+        (Some(n), None)
+    }
+
+    pub fn debug_dump(&self) {
+        fn dfs(node: &Option<NodeBox>, depth: usize) {
+            if let Some(n) = node {
+                for _ in 0..depth {
+                    serial_print!("  ");
+                }
+                serial_println!(
+                    "region base={:#x} size={} max_size={}",
+                    n.base,
+                    ByteSize(n.size as u64),
+                    ByteSize(n.max_size as u64)
+                );
+                dfs(&n.left, depth + 1);
+                dfs(&n.right, depth + 1);
+            }
+        }
+        serial_println!("---Tree dump---");
+        dfs(&self.root, 0);
+    }
+
+    pub fn free(&mut self, base: usize, size: usize) {
+        let mut new_base = base;
+        let mut new_size = size;
+
+        // collect keys to remove
+        let mut pred_key = None;
+        let mut succ_key = None;
+
+        // predecessor
+        if let Some(p) = self.predecessor(self.root.as_ref(), base) {
+            if p.end() >= new_base {
+                new_base = p.base;
+                new_size = (new_base + new_size).max(p.end()) - new_base;
+                pred_key = Some(p.base);
+            }
+        }
+
+        // successor
+        if let Some(s) = self.successor(self.root.as_ref(), base) {
+            if new_base + new_size >= s.base {
+                new_size = (s.base + s.size) - new_base;
+                succ_key = Some(s.base);
+            }
+        }
+
+        // actually delete nodes
+        if let Some(key) = pred_key {
+            self.root = RBTreeAlloc::delete(self.root.take(), key);
+        }
+        if let Some(key) = succ_key {
+            self.root = RBTreeAlloc::delete(self.root.take(), key);
+        }
+
+        // insert the merged region
+        self.insert(Region {
+            base: new_base,
+            size: new_size,
+        });
+    }
+
+    fn predecessor<'a>(
+        &self,
+        mut node: Option<&'a NodeBox>,
+        addr: usize,
+    ) -> Option<&'a TreeRegion> {
+        let mut pred = None;
+        while let Some(n) = node {
+            if n.base < addr {
+                pred = Some(&**n);
+                node = n.right.as_ref();
+            } else {
+                node = n.left.as_ref();
+            }
+        }
+        pred
+    }
+    fn successor<'a>(&self, mut node: Option<&'a NodeBox>, addr: usize) -> Option<&'a TreeRegion> {
+        let mut succ = None;
+        while let Some(n) = node {
+            if n.base >= addr {
+                succ = Some(&**n);
+                node = n.left.as_ref();
+            } else {
+                node = n.right.as_ref();
+            }
+        }
+        succ
+    }
+
+    fn move_red_left(mut h: NodeBox) -> NodeBox {
+        Self::flip_colors(&mut h);
+        if Self::is_red(&h.right.as_ref().unwrap().left) {
+            let mut r = h.right.take().unwrap();
+            r = Self::rotate_right(r);
+            h.right = Some(r);
+            h = Self::rotate_left(h);
+            Self::flip_colors(&mut h);
+        }
+        h
+    }
+    fn move_red_right(mut h: NodeBox) -> NodeBox {
+        Self::flip_colors(&mut h);
+        if Self::is_red(&h.left.as_ref().unwrap().left) {
+            h = Self::rotate_right(h);
+            Self::flip_colors(&mut h);
+        }
+        h
+    }
+    fn fix_up(mut h: NodeBox) -> NodeBox {
+        if Self::is_red(&h.right) {
+            h = Self::rotate_left(h);
+        }
+        if Self::is_red(&h.left) && Self::is_red(&h.left.as_ref().unwrap().left) {
+            h = Self::rotate_right(h);
+        }
+        if Self::is_red(&h.left) && Self::is_red(&h.right) {
+            Self::flip_colors(&mut h);
+        }
+        Self::update_max_size(&mut h);
+        h
+    }
+
+    fn min_node<'a>(mut h: &'a NodeBox) -> &'a TreeRegion {
+        while let Some(ref l) = h.left {
+            h = l;
+        }
+        h
+    }
+    fn delete_min(mut h: NodeBox) -> Option<NodeBox> {
+        if h.left.is_none() {
+            return None;
+        }
+        if !Self::is_red(&h.left) && !Self::is_red(&h.left.as_ref().unwrap().left) {
+            h = Self::move_red_left(h);
+        }
+        h.left = Self::delete_min(h.left.take().unwrap());
+        Some(Self::fix_up(h))
+    }
+
+    fn delete(h: Option<NodeBox>, key: usize) -> Option<NodeBox> {
+        let mut h = match h {
+            None => return None,
+            Some(h) => h,
+        };
+        if key < h.base {
+            if h.left.is_some() {
+                if !Self::is_red(&h.left) && !Self::is_red(&h.left.as_ref().unwrap().left) {
+                    h = Self::move_red_left(h);
+                }
+                h.left = Self::delete(h.left.take(), key);
+            }
+        } else {
+            if Self::is_red(&h.left) {
+                h = Self::rotate_right(h);
+            }
+            if key == h.base && h.right.is_none() {
+                return None;
+            }
+            if h.right.is_some() {
+                if !Self::is_red(&h.right) && !Self::is_red(&h.right.as_ref().unwrap().left) {
+                    h = Self::move_red_right(h);
+                }
+                if key == h.base {
+                    let min = Self::min_node(h.right.as_ref().unwrap());
+                    h.base = min.base;
+                    h.size = min.size;
+                    h.right = Self::delete_min(h.right.take().unwrap());
+                } else {
+                    h.right = Self::delete(h.right.take(), key);
+                }
+            }
+        }
+        Some(Self::fix_up(h))
+    }
+}
+
+pub static mut TREE_ALLOCATOR_DATA: RBTreeAlloc = RBTreeAlloc::new();
+
+pub struct TreeAlloc;
+pub static TREE_ALLOCATOR: TreeAlloc = TreeAlloc;
+
+impl TreeAlloc {
+    pub fn init(&self) {
+        unsafe {
+            let mut areas = [Region::default(); 128];
+            let count = find_heap_areas(&mut areas).unwrap();
+            let areas = &mut areas[..count];
+            for r in areas.iter_mut() {
+                if r.base == BUMP_HEAP_BASE {
+                    r.base += BUMP_HEAP_SIZE;
+                    r.size -= BUMP_HEAP_SIZE;
+                }
+            }
+            let mut total = 0;
+            for (i, r) in areas.iter().enumerate() {
+                serial_println!("init area {}: {}", i, ByteSize(r.size as u64));
+                total += r.size;
+                TREE_ALLOCATOR_DATA.insert(*r);
+            }
+            serial_println!("tree initialized with {}", ByteSize(total as u64));
+            KERNEL_ALLOC_MODE = KernelAllocMode::Tree;
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for TreeAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        unsafe {
+            if let Some(addr) = TREE_ALLOCATOR_DATA.alloc(layout.size(), layout.align()) {
+                addr as *mut u8
+            } else {
+                null_mut()
+            }
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        unsafe {
+            TREE_ALLOCATOR_DATA.free(ptr as usize, layout.size());
+        }
+    }
+}

@@ -34,10 +34,11 @@ SECTIONS
         __bss_end = .;
     }
 
-    /DISCARD/ :
-    {
+
+    /DISCARD/ : {
         *(.comment)
         *(.note)
         *(.eh_frame)
     }
+    
 }

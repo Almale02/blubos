@@ -1,0 +1,26 @@
+# --- Core USB controller tracing ---
+usb_packet_complete
+usb_packet_cancel
+usb_hcd_attach
+usb_hcd_detach
+usb_port_attach
+usb_port_detach
+usb_port_reset
+
+# --- EHCI host‑controller debug hooks ---
+usb_ehci_reset
+usb_ehci_exec
+usb_ehci_state
+usb_ehci_qh_advance
+usb_ehci_qh_load
+usb_ehci_qh_valid
+usb_ehci_qh_unload
+usb_ehci_td_start
+usb_ehci_td_complete
+usb_ehci_td_ep_complete
+usb_ehci_async_advance
+usb_ehci_port_attach
+usb_ehci_port_detach
+usb_ehci_port_reset
+usb_ehci_port_suspend
+usb_ehci_port_resume

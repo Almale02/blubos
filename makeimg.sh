@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 IMG_DIR="$SCRIPT_DIR/img"
 
-IMG="$IMG_DIR/blublang.img"
+IMG="$IMG_DIR/blubos.img"
 MNT="$IMG_DIR/mnt"
 SIZE=64M
 
