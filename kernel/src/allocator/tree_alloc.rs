@@ -218,69 +218,6 @@ impl RBTreeAlloc {
         }
     }
 
-    pub fn alloc(&mut self, size: usize, align: usize) -> Option<usize> {
-        let (root, out) = Self::alloc_rec(self.root.take(), size, align);
-        self.root = root;
-        if let Some(r) = self.root.as_mut() {
-            r.color = Color::Black;
-        }
-        out
-    }
-
-    fn alloc_rec(
-        node: Option<NodeBox>,
-        size: usize,
-        align: usize,
-    ) -> (Option<NodeBox>, Option<usize>) {
-        let mut n = match node {
-            None => return (None, None),
-            Some(n) => n,
-        };
-
-        if let Some(ref l) = n.left {
-            if l.max_size >= size {
-                let (new_left, out) = Self::alloc_rec(n.left.take(), size, align);
-                if out.is_some() {
-                    n.left = new_left;
-                    Self::update_max_size(&mut n);
-                    return (Some(n), out);
-                }
-                n.left = new_left;
-                Self::update_max_size(&mut n);
-            }
-        }
-
-        let aligned = (n.base + (align - 1)) & !(align - 1);
-        let adj = aligned - n.base;
-
-        if n.size >= adj + size {
-            // changed > to >= to allow exact fits
-            let alloc_base = aligned;
-            let consumed = adj + size;
-
-            n.base += consumed;
-            n.size -= consumed;
-            Self::update_max_size(&mut n);
-            return (Some(n), Some(alloc_base));
-        }
-
-        if let Some(ref r) = n.right {
-            if r.max_size >= size {
-                let (new_right, out) = Self::alloc_rec(n.right.take(), size, align);
-                if out.is_some() {
-                    n.right = new_right;
-                    Self::update_max_size(&mut n);
-                    return (Some(n), out);
-                }
-                n.right = new_right;
-                Self::update_max_size(&mut n);
-            }
-        }
-
-        Self::update_max_size(&mut n);
-        (Some(n), None)
-    }
-
     pub fn free(&mut self, base: usize, size: usize) {
         let mut new_base = base;
         let mut new_size = size;
@@ -441,9 +378,14 @@ impl RBTreeAlloc {
         Some(Self::fix_up(h))
     }
 
-    /// allocates under 4GB
-    pub fn alloc_low(&mut self, size: usize, align: usize) -> Option<usize> {
-        let (root, out) = Self::alloc_rec_low(self.root.take(), size, align);
+    pub fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        max_address: Option<usize>,
+        boundary: Option<usize>,
+    ) -> Option<usize> {
+        let (root, out) = Self::alloc_rec(self.root.take(), size, align, max_address, boundary);
         self.root = root;
         if let Some(r) = self.root.as_mut() {
             r.color = Color::Black;
@@ -451,19 +393,80 @@ impl RBTreeAlloc {
         out
     }
 
-    fn alloc_rec_low(
+    // fn alloc_rec(
+    //     node: Option<NodeBox>,
+    //     size: usize,
+    //     align: usize,
+    // ) -> (Option<NodeBox>, Option<usize>) {
+    //     let mut n = match node {
+    //         None => return (None, None),
+    //         Some(n) => n,
+    //     };
+
+    //     if let Some(ref l) = n.left {
+    //         if l.max_size >= size {
+    //             let (new_left, out) = Self::alloc_rec(n.left.take(), size, align);
+    //             if out.is_some() {
+    //                 n.left = new_left;
+    //                 Self::update_max_size(&mut n);
+    //                 return (Some(n), out);
+    //             }
+    //             n.left = new_left;
+    //             Self::update_max_size(&mut n);
+    //         }
+    //     }
+
+    //     let aligned = (n.base + (align - 1)) & !(align - 1);
+    //     let adj = aligned - n.base;
+
+    //     if n.size >= adj + size {
+    //         // changed > to >= to allow exact fits
+    //         let alloc_base = aligned;
+    //         let consumed = adj + size;
+
+    //         n.base += consumed;
+    //         n.size -= consumed;
+    //         Self::update_max_size(&mut n);
+    //         return (Some(n), Some(alloc_base));
+    //     }
+
+    //     if let Some(ref r) = n.right {
+    //         if r.max_size >= size {
+    //             let (new_right, out) = Self::alloc_rec(n.right.take(), size, align);
+    //             if out.is_some() {
+    //                 n.right = new_right;
+    //                 Self::update_max_size(&mut n);
+    //                 return (Some(n), out);
+    //             }
+    //             n.right = new_right;
+    //             Self::update_max_size(&mut n);
+    //         }
+    //     }
+
+    //     Self::update_max_size(&mut n);
+    //     (Some(n), None)
+    // }
+    fn alloc_rec(
         node: Option<NodeBox>,
         size: usize,
         align: usize,
+        max_address: Option<usize>,
+        boundary: Option<usize>, // new param!
     ) -> (Option<NodeBox>, Option<usize>) {
+        let max_address = match max_address {
+            Some(x) => x,
+            None => usize::MAX,
+        };
         let mut n = match node {
             None => return (None, None),
             Some(n) => n,
         };
 
+        // Try left subtree
         if let Some(ref l) = n.left {
             if l.max_size >= size {
-                let (new_left, out) = Self::alloc_rec_low(n.left.take(), size, align);
+                let (new_left, out) =
+                    Self::alloc_rec(n.left.take(), size, align, Some(max_address), boundary);
                 if out.is_some() {
                     n.left = new_left;
                     Self::update_max_size(&mut n);
@@ -473,23 +476,41 @@ impl RBTreeAlloc {
                 Self::update_max_size(&mut n);
             }
         }
+
+        //---------------------------------------
+        // Try allocating from this node's range
+        //---------------------------------------
         let aligned = (n.base + (align - 1)) & !(align - 1);
         let adj = aligned - n.base;
 
-        if n.size >= adj + size && aligned.to_physical_addr() + size <= 0x1_0000_0000 {
-            let alloc_base = aligned;
-            let consumed = adj + size;
+        // check we have enough space
+        if n.size >= adj + size {
+            // check boundary: allocation must not cross boundary window
+            // also ensure we're below 4 GiB limit
+            if aligned.to_physical_addr() + size <= max_address && {
+                boundary
+                    .map(|boundary| {
+                        (aligned & !(boundary - 1)) == ((aligned + size - 1) & !(boundary - 1))
+                    })
+                    .unwrap_or(true)
+            } {
+                let alloc_base = aligned;
+                let consumed = adj + size;
 
-            n.base += consumed;
-            n.size -= consumed;
-            Self::update_max_size(&mut n);
-            return (Some(n), Some(alloc_base));
+                n.base += consumed;
+                n.size -= consumed;
+                Self::update_max_size(&mut n);
+                return (Some(n), Some(alloc_base));
+            }
         }
 
-        // Right subtree search
+        //---------------------------------------
+        // Try right subtree
+        //---------------------------------------
         if let Some(ref r) = n.right {
             if r.max_size >= size {
-                let (new_right, out) = Self::alloc_rec_low(n.right.take(), size, align);
+                let (new_right, out) =
+                    Self::alloc_rec(n.right.take(), size, align, Some(max_address), boundary);
                 if out.is_some() {
                     n.right = new_right;
                     Self::update_max_size(&mut n);
@@ -504,11 +525,11 @@ impl RBTreeAlloc {
         (Some(n), None)
     }
 }
-pub struct TreeAllocLow;
-unsafe impl Allocator for TreeAllocLow {
+unsafe impl Allocator for TreeAlloc {
     fn allocate(&self, layout: Layout) -> Result<core::ptr::NonNull<[u8]>, AllocError> {
         unsafe {
-            if let Some(addr) = TREE_ALLOCATOR_DATA.alloc_low(layout.size(), layout.align()) {
+            if let Some(addr) = TREE_ALLOCATOR_DATA.alloc(layout.size(), layout.align(), None, None)
+            {
                 let ptr = addr as *mut u8;
                 Ok(core::ptr::NonNull::new_unchecked(
                     core::ptr::slice_from_raw_parts_mut(ptr, layout.size()),
@@ -527,8 +548,19 @@ unsafe impl Allocator for TreeAllocLow {
 
 pub static mut TREE_ALLOCATOR_DATA: RBTreeAlloc = RBTreeAlloc::new();
 
-pub struct TreeAlloc;
-pub static TREE_ALLOCATOR: TreeAlloc = TreeAlloc;
+pub struct TreeAlloc {
+    pub max_address: Option<usize>,
+    pub boundary: Option<usize>,
+}
+impl TreeAlloc {
+    pub const fn default() -> Self {
+        TreeAlloc {
+            max_address: None,
+            boundary: None,
+        }
+    }
+}
+pub static TREE_ALLOCATOR: TreeAlloc = TreeAlloc::default();
 
 impl TreeAlloc {
     pub fn init(&self) {
@@ -572,7 +604,8 @@ impl TreeAlloc {
 unsafe impl GlobalAlloc for TreeAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         unsafe {
-            if let Some(addr) = TREE_ALLOCATOR_DATA.alloc(layout.size(), layout.align()) {
+            if let Some(addr) = TREE_ALLOCATOR_DATA.alloc(layout.size(), layout.align(), None, None)
+            {
                 addr as *mut u8
             } else {
                 null_mut()

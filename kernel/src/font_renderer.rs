@@ -74,7 +74,7 @@ macro_rules! textbuff_print {
     ($($arg: tt)*) => {
         {
             use core::fmt::Write as _;
-            let _ = write!(crate::font_renderere::TextBufferWriter, $($arg)*);
+            let _ = write!(crate::font_renderer::TextBufferWriter, $($arg)*);
         }
     };
 }

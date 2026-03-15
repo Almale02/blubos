@@ -25,7 +25,7 @@ POSSIBLE_OVMF=(
   "/usr/share/qemu/OVMF_CODE.4m.fd"
 )
 
-OVMF_CODE=""
+# OVMF_CODE=""
 for candidate in "${POSSIBLE_OVMF[@]}"; do
     if [[ -f "$candidate" ]]; then
         OVMF_CODE="$candidate"
@@ -62,32 +62,36 @@ if [[ ! -f "$VARS_DEST" ]]; then
     fi
 fi
 
-# ✅ Launch QEMU
-# exec qemu-system-x86_64 -serial stdio \
-#     -drive if=pflash,format=raw,readonly=on,file="$CODE_DEST" \
-#     -drive if=pflash,format=raw,file="$VARS_DEST" \
-#     -drive format=raw,file="$IMG" \
-#     -trace "usb_ehci_*" -D qemu.log  \
-#     -device usb-ehci,id=ehci0, companion=none \
-# 	  -drive id=stick,file=blublang.img,if=none,format=raw \
-# 	  -device usb-storage,bus=ehci0.0,drive=stick,port=1
-    #-device usb-tablet,bus=ehci0.0,port=2 \
-     #-no-reboot -no-shutdown
+ # ✅ Launch QEMU
+ # exec qemu-system-x86_64 -serial stdio \
+ #     -drive if=pflash,format=raw,readonly=on,file="$CODE_DEST" \
+ #     -drive if=pflash,format=raw,file="$VARS_DEST" \
+ #     -drive format=raw,file="$IMG" \
+ #     -trace "usb_ehci_*" -D qemu.log  \
+ #     -device usb-ehci,id=ehci0, companion=none \
+ # 	  -drive id=stick,file=blublang.img,if=none,format=raw \
+ # 	  -device usb-storage,bus=ehci0.0,drive=stick,port=1
+ #   #-device usb-tablet,bus=ehci0.0,port=2 \
+ #    #-no-reboot -no-shutdown
 
 
-/home/danad/dev/qemu/build/qemu-system-x86_64 \
+qemu-system-x86_64 \
   -machine q35,usb=off \
   -serial stdio \
   -drive if=pflash,format=raw,readonly=on,file="$CODE_DEST" \
   -drive if=pflash,format=raw,file="$VARS_DEST" \
   -drive if=none,id=bootdisk,format=raw,file="$IMG" \
   -device virtio-blk-pci,drive=bootdisk,bootindex=0 \
-  -device usb-xhci,id=xhci \
-  -drive if=none,id=stick,file=blubos2.img,format=raw \
-  -d guest_errors \
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -drive if=none,id=stick,file=blubos.img,format=raw \
   -trace events=trace-events.txt \
   -trace enable=usb_xhci_* \
-  -D qemu.log \
+  -D qemu.log
+
+
+# /home/danad/dev/qemu/build/qemu-system-x86_64 \
+
   # -device usb-kbd,bus=ehci0.0,port=2 \
   # -device usb-storage,bus=ehci0.0,drive=stick,port=1 \
   # -trace "usb_ehci_*" -D qemu.log
@@ -97,7 +101,7 @@ fi
 #   -machine q35 \
 # 	-serial stdio \
 #   -device usb-ehci,id=ehci0 \
-#   -drive id=stick,file=blublang.img,if=none,format=raw \
+#   -drive id=stick,file=blubos.img,if=none,format=raw \
 #   -device usb-storage,bus=ehci0.0,drive=stick,port=1 \
 #   -drive if=pflash,format=raw,readonly=on,file="$CODE_DEST" \
 #   -drive if=pflash,format=raw,file="$VARS_DEST" \

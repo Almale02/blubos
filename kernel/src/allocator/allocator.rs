@@ -15,6 +15,7 @@ use x86_64::structures::paging::PageTable;
 use x86_64::structures::paging::Translate;
 
 use crate::allocator::bump_alloc::BUMP_ALLOCATOR;
+use crate::allocator::paging::PAGE_TABLE_MAPPER;
 use crate::allocator::tree_alloc::TREE_ALLOCATOR;
 
 static MEMMAP_REQ: MemoryMapRequest = MemoryMapRequest::new();
@@ -31,15 +32,25 @@ pub fn is_mapped(vaddr: u64) -> bool {
     mapper.translate_addr(VirtAddr::new(vaddr)).is_some()
 }
 pub fn to_physical_addr(virtual_addr: usize) -> usize {
-    let hhdm_offset = HHDM_REQ.get_response().unwrap().offset();
-    virtual_addr - hhdm_offset as usize
+    match unsafe { PAGE_TABLE_MAPPER.get() } {
+        Some(mapper) => mapper
+            .translate_addr(VirtAddr::new(virtual_addr as u64))
+            .unwrap()
+            .as_u64() as usize,
+        None => {
+            let hhdm_offset = HHDM_REQ.get_response().unwrap().offset();
+            virtual_addr - hhdm_offset as usize
+        }
+    }
 }
 pub trait GetPhysicalAddr {
     fn to_physical_addr(&self) -> usize;
 }
-impl<T, A: Allocator> GetPhysicalAddr for Box<T, A> {
+impl<T: ?Sized, A: Allocator> GetPhysicalAddr for Box<T, A> {
     fn to_physical_addr(&self) -> usize {
-        to_physical_addr((self.as_ref() as *const _) as usize)
+        let ptr = self.as_ref() as *const T;
+        let (data_ptr, _meta) = ptr.to_raw_parts();
+        to_physical_addr(data_ptr as usize)
     }
 }
 impl<T> GetPhysicalAddr for &T {

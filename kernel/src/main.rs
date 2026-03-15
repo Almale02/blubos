@@ -2,56 +2,62 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
-#![feature(new_zeroed_alloc)]
+#![feature(const_trait_impl)]
 #![feature(allocator_api)]
 #![feature(slice_ptr_get)]
+#![feature(ptr_metadata)]
 #![allow(static_mut_refs)]
 
 pub mod allocator;
+pub mod byte_ext;
 pub mod cpu_panic;
 pub mod font_renderer;
 pub mod framebuffer;
 pub mod pci;
+pub mod ps2;
 pub mod serial;
 pub mod time;
 
 extern crate alloc;
 
-use alloc::{boxed::Box, string::String};
+use alloc::string::String;
 use bytesize::ByteSize;
 use core::{
     alloc::{GlobalAlloc, Layout},
     arch::{asm, naked_asm},
-    hint::spin_loop,
     sync::atomic::{AtomicUsize, Ordering},
 };
 pub use limine::framebuffer::Framebuffer as LimlineFramebuffer;
 use limine::{BaseRevision, request::FramebufferRequest};
-use memoffset::offset_of;
 use spin::{Lazy, once::Once};
-use x86_64::structures::idt::InterruptDescriptorTable;
+use x86_64::{
+    VirtAddr,
+    structures::{
+        idt::{InterruptDescriptorTable, InterruptStackFrame},
+        paging::Translate,
+    },
+};
 
 use crate::{
     allocator::{
-        allocator::{AlignedBoxAlloc, GetPhysicalAddr},
         bump_alloc::{BUMP_ALLOCATOR, BUMP_HEAP_SIZE, init_bump_alloc},
         paging::{PAGE_TABLE_MAPPER, init_mapper, map_mmio_region},
-        tree_alloc::{TREE_ALLOCATOR, TreeAlloc, TreeAllocLow},
+        tree_alloc::{TREE_ALLOCATOR, TreeAlloc},
     },
+    byte_ext::ByteExt as _,
     cpu_panic::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, init_tss},
     font_renderer::{TEXT_OUT_BUFFER, TextBufferWriter},
     framebuffer::Framebuffer,
     pci::{
         pci::{PCI_SCANNER, PciScanner, enable_mmio_and_bus_master},
-        usb::ehci::{
-            controller::{DeviceEndpointRef, EHCI_CONTROLLER, EhciController, UsbDeviceDescriptor},
-            qtd::{EhciQtd, EhciQtdStatus, UsbSetupPacket},
-            queue_head::EhciQueueHead,
-            registers::*,
+        usb::xhci::{
+            controller::{XHCI_CONTROLLER, XhciController},
+            ring::{XhciCommandRing, XhciEventRing},
         },
     },
-    serial::{SerialWriter, inb, outb, serial_init, serial_write_str},
-    time::{irq0_handler, pit_init, wait_ms},
+    ps2::{KEYPRSS_COUNT, keyboard_handler},
+    serial::{inb, outb, serial_init, serial_write_str},
+    time::{irq0_handler, pit_init},
 };
 
 static FB_REQ: FramebufferRequest = FramebufferRequest::new();
@@ -59,7 +65,12 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
+
+    for i in 32..48 {
+        idt[i].set_handler_fn(catch_all_irq);
+    }
     idt[0x20].set_handler_fn(irq0_handler);
+    idt[0x21].set_handler_fn(keyboard_handler);
     idt.breakpoint.set_handler_fn(cpu_panic::breakpoint_handler);
     idt.general_protection_fault
         .set_handler_fn(cpu_panic::general_protection_fault_handler);
@@ -82,6 +93,13 @@ static TICKS: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C, packed)]
 struct DTBuf([u8; 10]);
+
+pub extern "x86-interrupt" fn catch_all_irq(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        outb(0xA0, 0x20);
+        outb(0x20, 0x20);
+    }
+}
 
 pub fn dump_idt_ptr() {
     let mut raw = DTBuf([0; 10]);
@@ -126,7 +144,7 @@ pub extern "C" fn kernel_stack_init() -> ! {
     IDT.load();
     init_bump_alloc();
 
-    let stack_ptr = alloc_stack(1024 * 256).unwrap_or_else(|| {
+    let stack_ptr = alloc_stack(256.kb()).unwrap_or_else(|| {
         serial_println!("failed to alloc new stack");
         panic!();
     });
@@ -146,188 +164,80 @@ fn kernel_main() {
     serial_write_str("kernel start\n");
     unsafe { asm!("sti") }
 
-    serial_println!("size is: {}", size_of::<EhciQtd>());
-
     if let Some(resp) = FB_REQ.get_response() {
         if let Some(fb) = resp.framebuffers().next() {
             unsafe { RENDER_BUFFER.call_once(|| Some(Framebuffer::new(fb))) };
         }
     }
     unsafe { TEXT_OUT_BUFFER.call_once(|| String::new()) };
+    unsafe { KEYPRSS_COUNT.call_once(|| 0) };
     unsafe { PAGE_TABLE_MAPPER.call_once(|| init_mapper()) };
 
     unsafe { PCI_SCANNER.call_once(|| PciScanner::new()) };
     unsafe { PCI_SCANNER.get_mut().unwrap().scan() };
 
     for func in unsafe { PCI_SCANNER.get().unwrap().iter() } {
-        if func.class.class == 0x0c && func.class.subclass == 0x03 && func.class.prog_if == 0x20 {
+        if func.class.class == 0xc && func.class.subclass == 0x03 && func.class.prog_if == 0x30 {
             enable_mmio_and_bus_master(func.loc);
             if let Some(phys_addr) = func.bars[0] {
                 unsafe {
-                    EHCI_CONTROLLER
-                        .call_once(|| EhciController::new(map_mmio_region(phys_addr, 0x1000)))
-                };
+                    let bar = map_mmio_region(phys_addr, 16.kb() as u64);
+                    let mapper = PAGE_TABLE_MAPPER.get_mut().unwrap();
+                    let physical = mapper.translate_addr(VirtAddr::new(bar as u64)).unwrap();
 
-                unsafe {
-                    let ehci = EHCI_CONTROLLER.get_mut().unwrap();
-                    let caplen = ehci.get_caplen();
-                    let n_ports = ehci.get_port_count() as usize;
+                    serial_println!(
+                        "found xhci, and mapped at: {:#x}, physical: {:#x}",
+                        bar as usize,
+                        physical.as_u64()
+                    );
+                    XHCI_CONTROLLER.call_once(|| XhciController::new(bar));
+                    let controller = XhciController::get_mut();
+                    let caps = controller.capabilities.read();
 
-                    serial_println!("EHCI capability length = {:#x}", caplen);
-                    serial_println!("EHCI reports {} ports", n_ports);
+                    serial_println!("capabilities: {:?}", caps);
 
-                    // Reset controller
-                    ehci.reset_controller();
-                    serial_println!("EHCI reset completed");
+                    controller.reset();
+                    serial_println!("controller reset");
 
-                    // Claim ownership (CONFIGFLAG = 1)
-                    ehci.set_config_flag();
-                    serial_println!("EHCI ownership flag set");
+                    XhciCommandRing::init_ring();
 
-                    ehci.set_asynclistaddr_ptr(ehci.anchor_qh.to_physical_addr() | 2);
+                    controller.setup_op_regs();
+                    serial_println!("op regs: {}", controller.op_registers.read());
+                    controller.setup_runtime_regs();
+                    XhciEventRing::init_ring();
+                    serial_println!("op regs: {}", controller.op_registers.read());
+                    serial_println!("runtime regs: {}", controller.runtime_registers.read());
 
-                    // Start controller (Run bit in USBCMD)
-                    ehci.add_cmd_flags(EhciCmd::RUN);
-
-                    while ehci.get_status_flags().contains(EhciStatus::HALTED) {
-                        spin_loop();
+                    match controller.start() {
+                        Ok(_) => serial_println!("controller started!"),
+                        Err(_) => serial_println!("controller failed to start!"),
                     }
+                    serial_println!("op regs: {}", controller.op_registers.read());
 
-                    ehci.new_queue_head_for_ep(DeviceEndpointRef {
-                        device_addr: 0,
-                        endpoint: 0,
-                    });
-                    ehci.set_device_control_queue_head(DeviceEndpointRef {
-                        device_addr: 0,
-                        endpoint: 0,
-                    });
-
-                    ehci.add_cmd_flags(EhciCmd::ASYNC_SCHEDULE_ENABLE);
-                    let status = ehci.get_status_flags();
-                    if status.contains(EhciStatus::PORT_CHANGE) {
-                        ehci.add_status_flags(EhciStatus::PORT_CHANGE);
-                    }
-
-                    while !ehci.get_status_flags().contains(EhciStatus::ASYNC_STATUS) {
-                        spin_loop();
-                    }
-
-                    // Handle ports
-                    for port in 0..n_ports.min(1) {
-                        let port_flags = ehci.get_port_control_flags(port);
-
-                        let connected = port_flags.contains(EhciPortControl::CURR_CONNECT_STATUS);
-                        let enabled = port_flags.contains(EhciPortControl::ENABLED);
-
-                        serial_println!(
-                            "Port {} before: {:?}, connected={}, enabled={}",
-                            port + 1,
-                            port_flags,
-                            connected,
-                            enabled
-                        );
-
-                        if connected && !enabled {
-                            serial_println!("Port {}: resetting...", port + 1);
-                            ehci.reset_port(port);
-                            serial_println!("Port {} enabled", port + 1);
+                    for i in 1..=caps.struct_param_1.max_ports() as usize {
+                        let port_reg = controller.get_port_reg(i).read();
+                        if port_reg.port_control.current_connect_status() {
+                            serial_println!("port {} is connected", i);
+                            serial_println!("{:?}\n", port_reg);
                         }
-
-                        let final_flags = ehci.get_port_control_flags(port);
-
-                        serial_println!(
-                            "Port {} after: {:?}, connected={}, enabled={}",
-                            port + 1,
-                            final_flags,
-                            final_flags.contains(EhciPortControl::CURR_CONNECT_STATUS),
-                            final_flags.contains(EhciPortControl::ENABLED),
-                        );
-                        if final_flags.contains(EhciPortControl::CURR_CONNECT_STATUS) {
-                            if !final_flags.contains(EhciPortControl::ENABLED) {
-                                panic!("failed to enable connected port");
-                            }
-                        } else {
-                            continue;
-                        }
-                        if final_flags.contains(EhciPortControl::PORT_OWNER) {
-                            serial_println!("found device at port {}, but it was not ehci", port);
-                            continue;
-                        }
-                        serial_println!(
-                            "port speed at: {} is: {:?}",
-                            port,
-                            ehci.get_port_speed(port)
-                        );
-
-                        let init_endpoint = DeviceEndpointRef::new(0, 0);
-                        let init_qh = ehci.qh_map.get_mut(&init_endpoint).unwrap();
-                        let init_qtds = ehci.qtd_map.get_mut(&init_endpoint).unwrap();
-
-                        let mut setup_buffer =
-                            Box::new_in_aligned(UsbSetupPacket::default(), TreeAllocLow, 0x1000);
-                        let mut data_buffer = Box::new_in_aligned(
-                            UsbDeviceDescriptor::default(),
-                            TreeAllocLow,
-                            0x1000,
-                        );
-                        assert_eq!(setup_buffer.to_physical_addr() & 0xFFF, 0);
-                        assert_eq!(data_buffer.to_physical_addr() & 0xFFF, 0);
-                        init_qtds.build_get_descriptor_req(
-                            setup_buffer.as_mut(),
-                            data_buffer.as_mut(),
-                            8,
-                        );
-                        init_qtds.link_qtds();
-                        init_qtds.activate();
-                        EHCI_CONTROLLER
-                            .get_mut()
-                            .unwrap()
-                            .activate_overlay(init_endpoint);
-
-                        while init_qh.token.status().contains(EhciQtdStatus::ACTIVE) {
-                            spin_loop();
-                        }
-
-                        serial_println!("data header is: {:?}", data_buffer);
-                        init_qtds.reset();
-
-                        serial_println!("finished");
-                        ehci.get_qh_mut(init_endpoint)
-                            .ep_char
-                            .set_max_packet_size(data_buffer.b_max_packet_size0 as u16);
-                        let init_qtds = ehci.qtd_map.get_mut(&init_endpoint).unwrap();
-                        init_qtds.build_set_address_req(&mut setup_buffer, 1);
-                        init_qtds.link_qtds();
-                        init_qtds.activate();
-                        EHCI_CONTROLLER
-                            .get_mut()
-                            .unwrap()
-                            .activate_overlay(init_endpoint);
-                        // serial_println!("setup data: {:?}", setup_buffer);
-                        if ehci.get_status_flags().contains(EhciStatus::INTERRUPT) {
-                            ehci.add_status_flags(EhciStatus::INTERRUPT);
-                        }
-                        serial_println!("status: {:?}", ehci.get_status_flags());
-                        serial_println!("setup data: {:?}", setup_buffer);
-                        wait_ms(20);
-                        ehci.dump(SerialWriter);
-                        serial_println!("status: {:?}", ehci.get_status_flags());
-
-                        // serial_println!("data is: {:?}", data_buffer);
                     }
                 }
             }
         }
     }
-
+    let mut prev_frametime = 0usize;
     loop {
-        // serial_println!("before tick: {}", TICKS.load(Ordering::Relaxed));
+        let start_tick = TICKS.load(Ordering::Relaxed);
         if let Some(framebuffer) = unsafe { RENDER_BUFFER.get_mut().unwrap() } {
             framebuffer.clear(framebuffer.rgb_color(128, 32, 64));
             textbuff_println!("i love banana");
             textbuff_println!("tick: {}", TICKS.load(Ordering::Relaxed));
             textbuff_println!("res: {}x{}", framebuffer.width(), framebuffer.height());
             textbuff_println!("pitch: {}", framebuffer.pitch_u32());
+            textbuff_println!("frame ticktime: {}", prev_frametime);
+            textbuff_println!("keypress count: {}", unsafe {
+                *KEYPRSS_COUNT.get_unchecked()
+            });
             TreeAlloc::write_init_areas(TextBufferWriter);
             framebuffer.draw_string(
                 5,
@@ -341,6 +251,8 @@ fn kernel_main() {
                 TEXT_OUT_BUFFER.get_mut().unwrap().clear();
             }
         }
+        let end_tick = TICKS.load(Ordering::Relaxed);
+        prev_frametime = end_tick - start_tick;
         // serial_println!("after tick: {}", TICKS.load(Ordering::Relaxed));
     }
 }
@@ -418,38 +330,89 @@ pub fn qemu_exit(code: u32) -> ! {
     }
 }
 
+// pub fn pic_remap() {
+//     // Initialization Command Words
+//     const ICW1_INIT: u8 = 0x10;
+//     const ICW1_ICW4: u8 = 0x01;
+//     const ICW4_8086: u8 = 0x01;
+
+//     unsafe {
+//         // Save masks
+//         let a1 = inb(0xA1);
+//         let a2 = inb(0x21);
+
+//         // Starts the initialization sequence in cascade mode
+//         outb(0x20, ICW1_INIT | ICW1_ICW4);
+//         outb(0xA0, ICW1_INIT | ICW1_ICW4);
+
+//         // ICW2: Master PIC vector offset
+//         outb(0x21, 0x20);
+//         // ICW2: Slave PIC vector offset
+//         outb(0xA1, 0x28);
+
+//         // ICW3: tell Master PIC that there is a slave PIC at IRQ2 (0000 0100)
+//         outb(0x21, 4);
+//         // ICW3: tell Slave PIC its cascade identity (0000 0010)
+//         outb(0xA1, 2);
+
+//         // ICW4: 8086 mode
+//         outb(0x21, ICW4_8086);
+//         outb(0xA1, ICW4_8086);
+
+//         // Restore saved masks
+//         outb(0x21, a2 & !0x03); // unmask IRQ0 by clearing bit 0
+//         outb(0xA1, a1);
+//     }
+// }
 pub fn pic_remap() {
     // Initialization Command Words
     const ICW1_INIT: u8 = 0x10;
     const ICW1_ICW4: u8 = 0x01;
     const ICW4_8086: u8 = 0x01;
 
+    // Port addresses
+    const MASTER_CMD: u16 = 0x20;
+    const MASTER_DATA: u16 = 0x21;
+    const SLAVE_CMD: u16 = 0xA0;
+    const SLAVE_DATA: u16 = 0xA1;
+
     unsafe {
-        // Save masks
-        let a1 = inb(0xA1);
-        let a2 = inb(0x21);
+        // 1. Start the initialization sequence (in cascade mode)
+        // This tells both PICs to expect 3 more initialization bytes
+        outb(MASTER_CMD, ICW1_INIT | ICW1_ICW4);
+        outb(SLAVE_CMD, ICW1_INIT | ICW1_ICW4);
 
-        // Starts the initialization sequence in cascade mode
-        outb(0x20, ICW1_INIT | ICW1_ICW4);
-        outb(0xA0, ICW1_INIT | ICW1_ICW4);
+        // 2. ICW2: Set the Vector Offsets
+        // We map Master IRQs to 32-39 and Slave IRQs to 40-47
+        // (This moves them out of the way of CPU Exceptions like Page Faults)
+        outb(MASTER_DATA, 0x20); // 32 in decimal
+        outb(SLAVE_DATA, 0x28); // 40 in decimal
 
-        // ICW2: Master PIC vector offset
-        outb(0x21, 0x20);
-        // ICW2: Slave PIC vector offset
-        outb(0xA1, 0x28);
+        // 3. ICW3: Tell the PICs how they are wired together
+        // Tell Master PIC that there is a slave PIC at IRQ2 (0000 0100)
+        outb(MASTER_DATA, 4);
+        // Tell Slave PIC its cascade identity (0000 0010)
+        outb(SLAVE_DATA, 2);
 
-        // ICW3: tell Master PIC that there is a slave PIC at IRQ2 (0000 0100)
-        outb(0x21, 4);
-        // ICW3: tell Slave PIC its cascade identity (0000 0010)
-        outb(0xA1, 2);
+        // 4. ICW4: Set 8086 mode
+        outb(MASTER_DATA, ICW4_8086);
+        outb(SLAVE_DATA, ICW4_8086);
 
-        // ICW4: 8086 mode
-        outb(0x21, ICW4_8086);
-        outb(0xA1, ICW4_8086);
+        // --- MASKING CONFIGURATION ---
 
-        // Restore saved masks
-        outb(0x21, a2 & !0x01); // unmask IRQ0 by clearing bit 0
-        outb(0xA1, a1);
+        // Master PIC:
+        // We must unmask:
+        // Bit 0: Timer (IRQ 0)
+        // Bit 1: Keyboard (IRQ 1)
+        // Bit 2: Slave Cascade (IRQ 2) - REQUIRED to hear anything from Slave!
+        // 0xF8 = 1111 1000 in binary
+        outb(MASTER_DATA, 0xF8);
+
+        // Slave PIC:
+        // For debugging on real hardware, we unmask EVERYTHING on the slave.
+        // This ensures that if the hardware fires a random interrupt (like the Mouse),
+        // our 'catch_all_irq' can send the EOI and prevent the system from freezing.
+        outb(SLAVE_DATA, 0x00);
     }
 }
 
@@ -497,3 +460,28 @@ pub fn switch_stack(new_stack_top: *mut u8) -> ! {
         );
     }
 }
+
+/*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*/

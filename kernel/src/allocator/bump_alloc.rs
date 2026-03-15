@@ -9,6 +9,7 @@ use bytesize::ByteSize;
 
 use crate::{
     allocator::allocator::{KERNEL_ALLOC_MODE, KernelAllocMode, Region, find_heap_areas},
+    byte_ext::ByteExt as _,
     serial_println,
 };
 
@@ -22,7 +23,7 @@ pub fn init_bump_alloc() {
         let areas = &areas[..area_count];
         let area = areas
             .iter()
-            .find(|x| x.size >= 3 * 1024_usize.pow(2))
+            .find(|x| x.size >= 5.mb())
             .unwrap_or_else(|| panic!("No suitable heap region found"));
 
         serial_println!(
@@ -32,7 +33,7 @@ pub fn init_bump_alloc() {
         );
         unsafe {
             BUMP_HEAP_BASE = area.base;
-            BUMP_HEAP_SIZE = 2 * 1024_usize.pow(2);
+            BUMP_HEAP_SIZE = 4.mb();
             NEXT.store(BUMP_HEAP_BASE, Ordering::Relaxed);
         }
         unsafe {

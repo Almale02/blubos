@@ -1,7 +1,14 @@
-use core::fmt::Write;
+use core::{
+    any::type_name,
+    fmt::Write,
+    marker::PhantomData,
+    ptr::{read_volatile, write_volatile},
+};
 
 use alloc::boxed::Box;
 use spin::Once;
+
+use crate::serial_println;
 
 #[inline]
 pub unsafe fn outl(port: u16, val: u32) {
@@ -445,3 +452,98 @@ impl PciScanner {
         }
     }
 }
+pub struct PciValue<T: Copy> {
+    ptr: *mut u8,
+    _p: PhantomData<T>,
+}
+impl<T: Copy> PciValue<T> {
+    pub fn new(ptr: *mut u8) -> Self {
+        if core::mem::size_of::<T>() % 4 != 0 {
+            serial_println!(
+                "{} must have a size that's a multiple of 4 bytes",
+                type_name::<T>()
+            );
+            panic!()
+        }
+
+        PciValue {
+            ptr,
+            _p: PhantomData,
+        }
+    }
+    #[inline(always)]
+    pub fn read(&self) -> T {
+        let size = size_of::<T>();
+
+        unsafe {
+            if size == 8 && (self.ptr as usize % 8 == 0) {
+                let val_u64 = read_volatile(self.ptr as *const u64);
+                return core::ptr::read_unaligned(&val_u64 as *const u64 as *const T);
+            }
+
+            let num_dwords = size / 4;
+            let mut value = core::mem::MaybeUninit::<T>::uninit();
+            let dst = value.as_mut_ptr() as *mut u32;
+
+            for i in 0..num_dwords {
+                let word = read_volatile(self.ptr.add(i * 4) as *const u32);
+                core::ptr::write(dst.add(i), word);
+            }
+            value.assume_init()
+        }
+    }
+    pub fn write(&self, value: &T) {
+        let size = size_of::<T>();
+
+        // If it's 8 bytes and 8-byte aligned, do it in one shot!
+        if size == 8 && (self.ptr as usize % 8 == 0) {
+            unsafe {
+                let val_u64 = core::ptr::read_unaligned(value as *const T as *const u64);
+                write_volatile(self.ptr as *mut u64, val_u64);
+            }
+        } else {
+            // Fallback to your 32-bit loop for everything else
+            let num_dwords = size / 4;
+            unsafe {
+                let src = value as *const T as *const u32;
+                for i in 0..num_dwords {
+                    let word = core::ptr::read(src.add(i));
+                    write_volatile(self.ptr.add(i * 4) as *mut u32, word);
+                }
+            }
+        }
+    }
+    pub fn modify(&mut self, closure: impl FnOnce(&mut T) -> ()) {
+        let mut value = self.read();
+        closure(&mut value);
+
+        self.write(&value);
+    }
+}
+/*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*/

@@ -17,7 +17,7 @@ unsafe impl FrameAllocator<Size4KiB> for RBTreeAlloc {
     fn allocate_frame(&mut self) -> Option<x86_64::structures::paging::PhysFrame<Size4KiB>> {
         let hhdm_offset = HHDM_REQ.get_response().unwrap().offset();
         let virt = self
-            .alloc(0x1000, 0x1000)
+            .alloc(0x1000, 0x1000, None, None)
             .map(|x| x as u64)
             .unwrap_or_else(|| panic!("failed to allocate for FrameAllocator"));
         Some(PhysFrame::containing_address(
